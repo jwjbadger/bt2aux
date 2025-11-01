@@ -1,5 +1,6 @@
 use esp_idf_svc::bt::{
     a2dp::{A2dpEvent, EspA2dp},
+    avrc::{controller::EspAvrcc, KeyCode},
     gap::{DiscoveryMode, EspGap, GapEvent},
     BtClassic, BtDriver,
 };
@@ -11,10 +12,16 @@ use esp_idf_svc::hal::{
         config::{DataBitWidth, StdConfig},
         I2sDriver,
     },
+    gpio::{PinDriver, Pull},
     gpio::Gpio23,
+    task::notification::Notification,
     prelude::*,
     sys::{esp, esp_bt_sp_param_t_ESP_BT_SP_IOCAP_MODE, ESP_BT_IO_CAP_IO, esp_bt_gap_set_security_param, esp_bt_gap_ssp_confirm_reply},
 };
+
+use core::num::NonZero;
+
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(feature = "experimental"))]
 fn main() {
@@ -28,6 +35,66 @@ fn main() {
 
     let peripherals = Peripherals::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
+
+    let mut high = PinDriver::output(peripherals.pins.gpio21).unwrap();
+    high.set_high().unwrap();
+
+    let mut skip = PinDriver::input(peripherals.pins.gpio22).unwrap();
+    let mut back = PinDriver::input(peripherals.pins.gpio23).unwrap();
+    let mut pause = PinDriver::input(peripherals.pins.gpio18).unwrap();
+    let mut play = PinDriver::input(peripherals.pins.gpio4).unwrap();
+
+    skip.set_pull(Pull::Down).unwrap();
+    back.set_pull(Pull::Down).unwrap();
+    pause.set_pull(Pull::Down).unwrap();
+    play.set_pull(Pull::Down).unwrap();
+
+    skip.set_interrupt_type(esp_idf_hal::gpio::InterruptType::PosEdge).unwrap();
+    back.set_interrupt_type(esp_idf_hal::gpio::InterruptType::PosEdge).unwrap();
+    pause.set_interrupt_type(esp_idf_hal::gpio::InterruptType::PosEdge).unwrap();
+    play.set_interrupt_type(esp_idf_hal::gpio::InterruptType::PosEdge).unwrap();
+
+    let notification = Notification::new();
+    let waker = notification.notifier();
+    let action: Arc<Mutex<Option<KeyCode>>> = Arc::new(Mutex::new(None));
+
+    unsafe {
+        let skip_waker = waker.clone();
+        let skip_action = action.clone();
+        skip
+            .subscribe(move || {
+                *skip_action.lock().unwrap() = Some(KeyCode::Forward);
+                skip_waker.notify(NonZero::new(1).unwrap());
+            })
+        .unwrap();
+
+        let back_waker = waker.clone();
+        let back_action = action.clone();
+        back
+            .subscribe(move || {
+                *back_action.lock().unwrap() = Some(KeyCode::Backward);
+                back_waker.notify(NonZero::new(2).unwrap());
+            })
+        .unwrap();
+
+        let pause_waker = waker.clone();
+        let pause_action = action.clone();
+        pause
+            .subscribe(move || {
+                *pause_action.lock().unwrap() = Some(KeyCode::Pause);
+                pause_waker.notify(NonZero::new(3).unwrap());
+            })
+        .unwrap();
+
+        let play_waker = waker.clone();
+        let play_action = action.clone();
+        play
+            .subscribe(move || {
+                *play_action.lock().unwrap() = Some(KeyCode::Play);
+                play_waker.notify(NonZero::new(4).unwrap());
+            })
+        .unwrap();
+    }
 
     let bt_driver: BtDriver<'_, BtClassic> = BtDriver::new(peripherals.modem, Some(nvs)).unwrap();
 
@@ -68,7 +135,11 @@ fn main() {
         };
     }).unwrap();
 
+    let avrc_driver = EspAvrcc::new(&bt_driver).unwrap();
     let a2dp = EspA2dp::new_sink(&bt_driver).unwrap();
+
+
+
     //a2dp.set_delay(core::time::Duration::from_millis(10000));
 
     let mut i2s_driver = I2sDriver::new_std_tx(
@@ -97,7 +168,29 @@ fn main() {
     gap.set_scan_mode(true, DiscoveryMode::Discoverable)
         .unwrap();
 
+    let mut transaction_label: u8 = 0;
+    
     loop {
-        FreeRtos::delay_ms(10000);
+        skip.enable_interrupt().unwrap();
+        back.enable_interrupt().unwrap();
+        pause.enable_interrupt().unwrap();
+        play.enable_interrupt().unwrap();
+
+        notification.wait_any();
+        
+        let mut action = action.lock().unwrap();
+
+        if let Some(action) = *action {
+            avrc_driver.send_passthrough(transaction_label, action, true).unwrap();
+        }
+
+        *action = None;
+
+        transaction_label += 1;
+        if transaction_label > 15 {
+            transaction_label = 0;
+        }
+
+        FreeRtos::delay_ms(200); // debounce
     }
 }
